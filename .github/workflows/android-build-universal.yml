@@ -1,0 +1,291 @@
+name: Build Brotherhood APK from Brotherhood.zip
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - Brotherhood.zip
+      - .github/workflows/android-build.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brotherhood-android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_ARCHIVE: Brotherhood.zip
+  BUILD_ROOT: ${{ github.workspace }}/.ci-extracted
+  BROTHERHOOD_API_BASE_URL: ${{ secrets.BROTHERHOOD_API_BASE_URL }}
+  EXPECTED_APPLICATION_ID: org.federationofavatars.brotherhood
+  EXPECTED_MIN_SDK: "26"
+  EXPECTED_TARGET_SDK: "36"
+
+jobs:
+  build-apk:
+    name: Unpack, test and build Brotherhood APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Detect Development signing configuration
+        id: signing
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.BROTHERHOOD_DEV_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.BROTHERHOOD_DEV_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.BROTHERHOOD_DEV_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.BROTHERHOOD_DEV_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: ${{ vars.BROTHERHOOD_DEV_CERT_SHA256 }}
+        run: |
+          set -Eeuo pipefail
+          missing=()
+          [ -n "${KEYSTORE_B64:-}" ] || missing+=("BROTHERHOOD_DEV_KEYSTORE_BASE64")
+          [ -n "${STORE_PASSWORD:-}" ] || missing+=("BROTHERHOOD_DEV_KEYSTORE_PASSWORD")
+          [ -n "${KEY_ALIAS:-}" ] || missing+=("BROTHERHOOD_DEV_KEY_ALIAS")
+          [ -n "${KEY_PASSWORD:-}" ] || missing+=("BROTHERHOOD_DEV_KEY_PASSWORD")
+          [ -n "${EXPECTED_CERT_SHA256:-}" ] || missing+=("BROTHERHOOD_DEV_CERT_SHA256")
+
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "artifact_class=Development" >> "$GITHUB_OUTPUT"
+            echo "Signing mode: CANONICAL DEVELOPMENT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "artifact_class=NON_CANONICAL_DEBUG" >> "$GITHUB_OUTPUT"
+            echo "::warning::Permanent Development signing is not configured."
+            printf '::warning::Missing signing setting: %s\n' "${missing[@]}"
+            echo "::warning::The APK is for uninstall/reinstall testing; update continuity is not guaranteed."
+          fi
+
+      - name: Verify Brotherhood.zip
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f "$SOURCE_ARCHIVE" || { echo "ERROR: $SOURCE_ARCHIVE not found in repository root."; exit 1; }
+          unzip -t "$SOURCE_ARCHIVE"
+          sha256sum "$SOURCE_ARCHIVE" | tee Brotherhood.zip.sha256
+          echo "[PASS] Brotherhood.zip found"
+          echo "[PASS] archive integrity"
+
+      - name: Extract archive and locate Android project
+        id: project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf "$BUILD_ROOT"
+          mkdir -p "$BUILD_ROOT"
+          unzip -q "$SOURCE_ARCHIVE" -d "$BUILD_ROOT"
+          test -d "$BUILD_ROOT/Brotherhood" || { echo "ERROR: top-level directory must be Brotherhood/."; exit 1; }
+          mapfile -t SETTINGS_FILES < <(find "$BUILD_ROOT/Brotherhood" -type f \( -name settings.gradle -o -name settings.gradle.kts \) | sort)
+          test "${#SETTINGS_FILES[@]}" -eq 1 || { echo "ERROR: expected one Gradle root, found ${#SETTINGS_FILES[@]}."; printf '%s\n' "${SETTINGS_FILES[@]}"; exit 1; }
+          ANDROID_DIR="$(dirname "${SETTINGS_FILES[0]}")"
+          test -f "$ANDROID_DIR/gradlew" || { echo "ERROR: Gradle Wrapper missing."; exit 1; }
+          test -f "$ANDROID_DIR/app/build.gradle.kts" -o -f "$ANDROID_DIR/app/build.gradle" || { echo "ERROR: Android app module missing."; exit 1; }
+          echo "android_dir=$ANDROID_DIR" >> "$GITHUB_OUTPUT"
+          echo "[PASS] extracted"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Gradle Wrapper
+        shell: bash
+        working-directory: ${{ steps.project.outputs.android_dir }}
+        run: |
+          set -Eeuo pipefail
+          chmod +x ./gradlew
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            test -f gradle/wrapper/WrapperDownloader.java || { echo "ERROR: wrapper JAR and downloader are missing."; exit 1; }
+            java gradle/wrapper/WrapperDownloader.java gradle/wrapper/gradle-wrapper.jar
+          fi
+
+      - name: Set up Gradle cache and validation
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ] && [ -n "${ANDROID_HOME:-}" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort | tail -1)"
+          fi
+          test -n "$SDKMANAGER" -a -x "$SDKMANAGER" || { echo "ERROR: sdkmanager not found."; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Restore and verify Development keystore
+        if: steps.signing.outputs.ready == 'true'
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.BROTHERHOOD_DEV_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.BROTHERHOOD_DEV_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.BROTHERHOOD_DEV_KEY_ALIAS }}
+          EXPECTED_CERT_SHA256: ${{ vars.BROTHERHOOD_DEV_CERT_SHA256 }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          SIGNING_DIR="$GITHUB_WORKSPACE/.ci-signing"
+          KEYSTORE_PATH="$SIGNING_DIR/brotherhood-development.jks"
+          mkdir -p "$SIGNING_DIR"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$KEYSTORE_PATH"
+          chmod 600 "$KEYSTORE_PATH"
+          keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          ACTUAL_KEY_FP="$(keytool -list -v -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS" | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -1 | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          EXPECTED_KEY_FP="$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          test -n "$ACTUAL_KEY_FP" || { echo "ERROR: Development certificate SHA-256 not found."; exit 1; }
+          test "$ACTUAL_KEY_FP" = "$EXPECTED_KEY_FP" || { echo "ERROR: Development certificate mismatch."; exit 1; }
+          echo "DEV_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Run tests and build APK
+        shell: bash
+        working-directory: ${{ steps.project.outputs.android_dir }}
+        env:
+          SIGNING_READY: ${{ steps.signing.outputs.ready }}
+          BROTHERHOOD_DEV_SIGNING_STORE_FILE: ${{ env.DEV_KEYSTORE_PATH }}
+          BROTHERHOOD_DEV_SIGNING_STORE_PASSWORD: ${{ secrets.BROTHERHOOD_DEV_KEYSTORE_PASSWORD }}
+          BROTHERHOOD_DEV_SIGNING_KEY_ALIAS: ${{ secrets.BROTHERHOOD_DEV_KEY_ALIAS }}
+          BROTHERHOOD_DEV_SIGNING_KEY_PASSWORD: ${{ secrets.BROTHERHOOD_DEV_KEY_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          if [ "$SIGNING_READY" != "true" ]; then
+            echo "::warning::Building NON_CANONICAL_DEBUG for uninstall/reinstall testing."
+            unset BROTHERHOOD_DEV_SIGNING_STORE_FILE BROTHERHOOD_DEV_SIGNING_STORE_PASSWORD BROTHERHOOD_DEV_SIGNING_KEY_ALIAS BROTHERHOOD_DEV_SIGNING_KEY_PASSWORD
+          fi
+          ./gradlew -PbrotherhoodApiBaseUrl="${BROTHERHOOD_API_BASE_URL:-https://example.invalid}" --no-daemon --stacktrace clean testDebugUnitTest compileDebugKotlin assembleDebug
+          echo "[PASS] Gradle unit tests"
+          echo "[PASS] compileDebugKotlin"
+          echo "[PASS] assembleDebug"
+
+      - name: Collect and verify APK
+        id: artifact
+        shell: bash
+        working-directory: ${{ steps.project.outputs.android_dir }}
+        env:
+          SIGNING_READY: ${{ steps.signing.outputs.ready }}
+          EXPECTED_CERT_SHA256: ${{ vars.BROTHERHOOD_DEV_CERT_SHA256 }}
+        run: |
+          set -Eeuo pipefail
+          OUTPUT_DIR="$GITHUB_WORKSPACE/apk-artifact"
+          rm -rf "$OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
+          mapfile -t APKS < <(find app/build/outputs/apk/debug -type f -name '*.apk' | sort)
+          test "${#APKS[@]}" -eq 1 || { echo "ERROR: expected exactly one APK, found ${#APKS[@]}."; printf '%s\n' "${APKS[@]}"; exit 1; }
+          APK_SOURCE="${APKS[0]}"
+          echo "[PASS] APK exists"
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)"
+          AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -1)"
+          test -x "$APKSIGNER" || { echo "ERROR: apksigner not found."; exit 1; }
+          test -x "$AAPT" || { echo "ERROR: aapt not found."; exit 1; }
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK_SOURCE" | tee "$OUTPUT_DIR/APKSIGNER_VERIFY.txt"
+          echo "[PASS] APK signature verify"
+          ACTUAL_SIGNER="$(sed -n -E 's/^.*certificate SHA-256 digest:[[:space:]]*([0-9A-Fa-f:]+)[[:space:]]*$/\1/p' "$OUTPUT_DIR/APKSIGNER_VERIFY.txt" | head -1 | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+          test -n "$ACTUAL_SIGNER" || { echo "ERROR: signer fingerprint not found."; exit 1; }
+
+          if [ "$SIGNING_READY" = "true" ]; then
+            BUILD_CLASS="DEVELOPMENT"
+            EXPECTED_SIGNER="$(printf '%s' "$EXPECTED_CERT_SHA256" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]')"
+            test "$ACTUAL_SIGNER" = "$EXPECTED_SIGNER" || { echo "ERROR: APK signer mismatch."; exit 1; }
+            SIGNING_IDENTITY_VERIFICATION="PASS"
+            echo "[PASS] signer continuity"
+          else
+            BUILD_CLASS="NON_CANONICAL_DEBUG"
+            SIGNING_IDENTITY_VERIFICATION="NON_CANONICAL"
+            echo "::warning::[WARN] signer continuity is not enforced in NON_CANONICAL_DEBUG"
+          fi
+
+          BADGING="$("$AAPT" dump badging "$APK_SOURCE")"
+          printf '%s\n' "$BADGING" > "$OUTPUT_DIR/AAPT_BADGING.txt"
+          PACKAGE_LINE="$(printf '%s\n' "$BADGING" | grep -m1 '^package:' || true)"
+          APP_ID="$(printf '%s\n' "$PACKAGE_LINE" | awk -F"'" '{print $2}')"
+          VERSION_CODE="$(printf '%s\n' "$PACKAGE_LINE" | awk -F"'" '{print $4}')"
+          VERSION_NAME="$(printf '%s\n' "$PACKAGE_LINE" | awk -F"'" '{print $6}')"
+          MIN_SDK="$(printf '%s\n' "$BADGING" | sed -n "s/^sdkVersion:'\([^']*\)'.*/\1/p" | head -1)"
+          TARGET_SDK="$(printf '%s\n' "$BADGING" | sed -n "s/^targetSdkVersion:'\([^']*\)'.*/\1/p" | head -1)"
+          printf '%s\n' "$BADGING" | grep -q '^application-debuggable' && DEBUGGABLE=true || DEBUGGABLE=false
+
+          BUILD_FILE="app/build.gradle.kts"
+          SOURCE_VERSION_CODE="$(sed -n -E 's/^[[:space:]]*versionCode[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' "$BUILD_FILE" | head -1)"
+          SOURCE_VERSION_NAME="$(sed -n -E 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$BUILD_FILE" | head -1)"
+          test -n "$SOURCE_VERSION_CODE" -a -n "$SOURCE_VERSION_NAME" || { echo "ERROR: source version metadata not found."; exit 1; }
+
+          verify_metadata() {
+            local label="$1" actual="$2" expected="$3"
+            test "$actual" = "$expected" || { printf 'ERROR: metadata %s mismatch: actual=%s expected=%s\n' "$label" "${actual:-<empty>}" "$expected"; exit 1; }
+            printf '[PASS] %s = %s\n' "$label" "$actual"
+          }
+          verify_metadata applicationId "$APP_ID" "$EXPECTED_APPLICATION_ID"
+          verify_metadata versionCode "$VERSION_CODE" "$SOURCE_VERSION_CODE"
+          verify_metadata versionName "$VERSION_NAME" "$SOURCE_VERSION_NAME"
+          verify_metadata minSdk "$MIN_SDK" "$EXPECTED_MIN_SDK"
+          verify_metadata targetSdk "$TARGET_SDK" "$EXPECTED_TARGET_SDK"
+          test "$DEBUGGABLE" = true || { echo "ERROR: Development/debug APK must be debuggable."; exit 1; }
+
+          SAFE_VERSION_NAME="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._-' '_')"
+          APK_NAME="Brotherhood-v${SAFE_VERSION_NAME}-${BUILD_CLASS}-b${VERSION_CODE}.apk"
+          ARTIFACT_NAME="Brotherhood-v${SAFE_VERSION_NAME}-${BUILD_CLASS}-${VERSION_CODE}"
+          APK="$OUTPUT_DIR/$APK_NAME"
+          cp "$APK_SOURCE" "$APK"
+          APK_SHA256="$(sha256sum "$APK" | awk '{print $1}')"
+          printf '%s  %s\n' "$APK_SHA256" "$APK_NAME" > "$OUTPUT_DIR/APK_SHA256SUMS.txt"
+          cp "$GITHUB_WORKSPACE/Brotherhood.zip.sha256" "$OUTPUT_DIR/"
+          echo "[PASS] APK SHA-256"
+
+          cat > "$OUTPUT_DIR/BUILD_SIGNING_REPORT.txt" <<EOF
+          Build class: $BUILD_CLASS
+          Distribution: INTERNAL TESTING ONLY
+          Production release: NO
+          Application ID: $APP_ID
+          Version name: $VERSION_NAME
+          Version code: $VERSION_CODE
+          Debuggable: $DEBUGGABLE
+          Min SDK: $MIN_SDK
+          Target SDK: $TARGET_SDK
+          APK filename: $APK_NAME
+          APK SHA-256: $APK_SHA256
+          Signer SHA-256: $ACTUAL_SIGNER
+          Signature verification: PASS
+          Signing identity verification: $SIGNING_IDENTITY_VERIFICATION
+          EOF
+          if [ "$SIGNING_READY" != "true" ]; then
+            cat >> "$OUTPUT_DIR/BUILD_SIGNING_REPORT.txt" <<EOF
+          Update continuity: NOT GUARANTEED
+          Install mode: UNINSTALL PREVIOUS APK IF SIGNER DIFFERS
+          EOF
+          fi
+          echo "artifact_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          cat "$OUTPUT_DIR/BUILD_SIGNING_REPORT.txt"
+
+      - name: Remove temporary Development keystore
+        if: always()
+        shell: bash
+        run: rm -rf "$GITHUB_WORKSPACE/.ci-signing"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.artifact_name }}
+          path: ${{ steps.artifact.outputs.artifact_dir }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Mark Android CI artifact gate PASS
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "[PASS] artifact upload"
+          echo "ANDROID_CI_APK_ARTIFACT_PASS"
